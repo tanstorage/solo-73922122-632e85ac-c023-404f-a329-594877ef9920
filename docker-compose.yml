@@ -1,0 +1,28 @@
+services:
+  market-source:
+    build: ./market_source
+    container_name: cu-market-source
+    ports:
+      - "8000:8000"   # 行情源：/snapshot、/ws、/control/*、/docs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/status')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  collector:
+    build: ./collector
+    container_name: cu-collector
+    environment:
+      SYMBOL: CU2601
+      SOURCE_HTTP: http://market-source:8000
+      SOURCE_WS: ws://market-source:8000/ws
+      MAX_LEVELS: "20"
+      RECONNECT_DELAY: "1.0"
+      DATA_TIMEOUT: "5.0"
+      SNAPSHOT_TIMEOUT: "30.0"
+    ports:
+      - "8001:8000"   # 采集器：/book、/status、/docs
+    depends_on:
+      market-source:
+        condition: service_healthy
