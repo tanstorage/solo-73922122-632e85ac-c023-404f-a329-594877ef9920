@@ -1,12 +1,14 @@
 """本地铜期货行情源（含故障注入，仅供开发/测试）。
 
-- GET  /snapshot   全量快照：序号 + 完整买卖盘（可用 ?delay= 或控制面设置延迟）
-- WS   /ws         增量流：连续序号、多档变更、qty=0 删档；另有周期心跳
-- POST /control/*  故障注入：延迟快照、制造丢序、断线、重放重复增量、暂停推送
+- GET  /snapshot   全量快照：序号 + 完整买卖盘 + 摘要链头（可用 ?delay= 或控制面设置延迟）
+- WS   /ws         增量流：连续序号、多档变更、qty=0 删档、逐帧 SHA-256 链式摘要；另有周期心跳
+- POST /control/*  故障注入：延迟快照、制造丢序、断线、重放重复增量、暂停推送、
+                   传输篡改（一次只改发出帧，不改源盘口和摘要链）
 """
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import random
@@ -15,6 +17,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+
+from .digest import ALGO, chain_digest, genesis_digest
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("market-source")
@@ -38,6 +42,8 @@ class MarketSource:
         self.tick_interval = 0.5       # 增量推送间隔（秒）
         self.paused_until = 0.0        # 暂停推送直到该 monotonic 时刻
         self.last_increment: dict | None = None
+        self.digest = genesis_digest(self.symbol)  # 摘要链头（对应 self.seq）
+        self.tampered_sent = 0         # 已注入的传输篡改次数（统计）
         self._seed()
 
     def _seed(self) -> None:
@@ -51,6 +57,7 @@ class MarketSource:
             "seq": self.seq,
             "bids": [[p, q] for p, q in sorted(self.bids.items(), reverse=True)],
             "asks": [[p, q] for p, q in sorted(self.asks.items())],
+            "digest": self.digest,  # 快照序号对应的摘要链头（采集器核验基线）
         }
 
     def make_increment(self) -> dict:
@@ -79,7 +86,15 @@ class MarketSource:
                 book[price] = qty
             changes.append({"side": side, "price": price, "qty": qty})
 
-        inc = {"type": "increment", "symbol": self.symbol, "seq": self.seq, "changes": changes}
+        # 摘要链按原始内容推进；帧携带本条摘要
+        self.digest = chain_digest(self.digest, self.symbol, self.seq, changes)
+        inc = {
+            "type": "increment",
+            "symbol": self.symbol,
+            "seq": self.seq,
+            "changes": changes,
+            "digest": self.digest,
+        }
         self.last_increment = inc
         return inc
 
@@ -175,12 +190,15 @@ async def get_status() -> dict:
     return {
         "symbol": source.symbol,
         "seq": source.seq,
+        "digest": source.digest,
+        "digest_algo": ALGO,
         "levels": {"bids": len(source.bids), "asks": len(source.asks)},
         "clients": len(source.clients),
         "snapshot_delay": source.snapshot_delay,
         "pending_gap": source.pending_gap,
         "tick_interval": source.tick_interval,
         "paused": time.monotonic() < source.paused_until,
+        "tampered_sent": source.tampered_sent,
     }
 
 
@@ -221,3 +239,47 @@ async def control_duplicate() -> dict:
 async def control_pause(seconds: float = 3.0) -> dict:
     source.paused_until = time.monotonic() + max(0.0, seconds)
     return {"ok": True, "paused_seconds": max(0.0, seconds)}
+
+
+@app.post(
+    "/control/tamper",
+    summary="传输篡改：立即发一条增量，只改发出帧，不改源盘口和摘要链（一次性）",
+)
+async def control_tamper(
+    field: str = Query(default="qty", description="篡改字段：qty | price | digest"),
+    value: int | None = Query(default=None, description="篡改后的取值（缺省自动取异于原值的合法值）"),
+    change_index: int = Query(default=0, ge=0, description="篡改本条增量的第几条变更"),
+) -> dict:
+    # 1) 正常生成下一条增量：源盘口与摘要链按原始内容推进（不受篡改影响）
+    inc = source.make_increment()
+    # 2) 仅篡改"发出帧"的副本，模拟传输途中价量被改写
+    sent = copy.deepcopy(inc)
+    idx = min(change_index, len(sent["changes"]) - 1)
+    ch = sent["changes"][idx]
+    if field == "qty":
+        new = value if value is not None else ch["qty"] + 1
+        if not isinstance(new, int) or new < 0 or new == ch["qty"]:
+            return {"ok": False, "reason": "qty 须为 >=0 且异于原值的整数", "original_qty": ch["qty"]}
+        ch["qty"] = new
+    elif field == "price":
+        new = value if value is not None else ch["price"] + TICK
+        if not isinstance(new, int) or new <= 0 or new == ch["price"]:
+            return {"ok": False, "reason": "price 须为 >0 且异于原值的整数", "original_price": ch["price"]}
+        ch["price"] = new
+    elif field == "digest":
+        d = sent["digest"]
+        sent["digest"] = ("0" if d[0] != "0" else "1") + d[1:]
+    else:
+        return {"ok": False, "reason": "field 须为 qty | price | digest"}
+    source.tampered_sent += 1
+    await broadcast(sent)
+    log.warning("tamper injected: seq=%d field=%s (source book & digest chain intact)", sent["seq"], field)
+    return {
+        "ok": True,
+        "tampered_seq": sent["seq"],
+        "field": field,
+        "change_index": idx,
+        "sent": sent,
+        "original": inc,
+        "note": "仅发出帧被改写；源盘口与摘要链仍为原始内容，采集器应将该序号标为首个异常",
+    }

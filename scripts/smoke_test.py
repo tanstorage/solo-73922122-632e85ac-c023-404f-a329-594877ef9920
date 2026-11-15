@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""端到端冒烟测试：验证盘口重建在丢序/断线/延迟快照下的行为。
+"""端到端冒烟测试：验证盘口重建在丢序/断线/延迟快照/传输篡改下的行为。
 
 用法：
     python3 scripts/smoke_test.py [--collector http://localhost:8001] [--source http://localhost:8000]
@@ -10,7 +10,8 @@
 3. 丢序 -> /book 变 503 -> 自动重同步恢复；
 4. 断线 -> 503 -> 自动恢复；
 5. 延迟快照 + 断线 -> 恢复期间 503，最终恢复且序号不回退；
-6. 全程序号单调不回退，盘口结构合法（整数价量、每侧 <=20 档、买卖不交叉）。
+6. 传输篡改 -> 503 + /status 标明首个异常序号 -> 自动重建且留痕；
+7. 全程序号单调不回退，盘口结构合法（整数价量、每侧 <=20 档、买卖不交叉）。
 """
 from __future__ import annotations
 
@@ -75,6 +76,20 @@ def wait_unsynced(c: httpx.Client, timeout: float) -> bool:
     return False
 
 
+def wait_digest_match(c: httpx.Client, s: httpx.Client, timeout: float) -> bool:
+    """采集器链头追平行情源链头（双方都在推进，轮询等一个对齐窗口）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            b = c.get("/book")
+            if b.status_code == 200 and b.json().get("digest") == s.get("/status").json().get("digest"):
+                return True
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.1)
+    return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--collector", default="http://localhost:8001")
@@ -131,7 +146,29 @@ def main() -> int:
     st = col.get("/status").json()
     print(f"     stats: {st['stats']}")
 
-    print("== 6. 连续观察 5 秒 ==")
+    print("== 6. 传输篡改 -> 503 + 首个异常序号 -> 自动重建 ==")
+    t = src.post("/control/tamper", params={"field": "qty"}).json()
+    check("篡改注入成功", t.get("ok") is True, str(t)[:120])
+    tseq = t["tampered_seq"]
+    check("篡改后进入失步", wait_unsynced(col, 10))
+    r = col.get("/book")
+    check("篡改后 /book 返回 503", r.status_code == 503, f"got {r.status_code}")
+    check("503 携带异常序号", r.json().get("anomaly_seq") == tseq,
+          f"body anomaly_seq={r.json().get('anomaly_seq')} tampered={tseq}")
+    v = col.get("/status").json()["verification"]
+    check("/status 标明首个异常序号", v["anomaly_seq"] == tseq,
+          f"anomaly_seq={v['anomaly_seq']} tampered={tseq}")
+    check("/verification 同步可查", col.get("/verification").json().get("anomaly_seq") == tseq)
+    check("篡改后自动重建", wait_synced(col, 30))
+    v = col.get("/status").json()["verification"]
+    check("重建后链恢复可信", v["chain_ok"] is True)
+    check("异常留痕保留", (v["last_anomaly"] or {}).get("seq") == tseq,
+          f"last_anomaly={v['last_anomaly']}")
+    check("核验失败被计数", v["failures"] >= 1, f"failures={v['failures']}")
+    check("重建后链头追平行情源", wait_digest_match(col, src, 10))
+    check_book_shape(col.get("/book").json())
+
+    print("== 7. 连续观察 5 秒 ==")
     end = time.monotonic() + 5
     while time.monotonic() < end:
         r = col.get("/book")
